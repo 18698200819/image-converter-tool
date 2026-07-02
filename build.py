@@ -46,6 +46,7 @@ def build_command() -> list[str]:
         "--hidden-import", "PIL.Image",
         "--hidden-import", "PIL._tkinter_finder",
         "--hidden-import", "pillow_heif",
+        "--hidden-import", "vtracer",
         "--hidden-import", "tkinter",
         "--hidden-import", "tkinter.filedialog",
         "--hidden-import", "tkinter.messagebox",
@@ -53,6 +54,7 @@ def build_command() -> list[str]:
         # -- 收集子模块 --
         "--collect-submodules", "PIL",
         "--collect-submodules", "customtkinter",
+        "--collect-submodules", "vtracer",
     ]
 
     # 添加额外数据文件

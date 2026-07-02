@@ -4,6 +4,9 @@
 """
 
 import os
+import subprocess
+import shutil
+import tempfile
 import threading
 from pathlib import Path
 
@@ -21,10 +24,22 @@ try:
 except ImportError:
     pass
 
+# Potrace 是可选的，用于 SVG 矢量化
+POTRACE_PATH = shutil.which("potrace")
+POTRACE_AVAILABLE = POTRACE_PATH is not None
+
+# VTrace：纯 Python 矢量化方案（无需安装 potrace.exe）
+VTRACE_AVAILABLE = False
+try:
+    import vtracer  # noqa: F401
+    VTRACE_AVAILABLE = True
+except ImportError:
+    pass
+
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
-ALL_FORMATS = ["PNG", "JPEG", "TIFF", "BMP", "WEBP", "ICO"]
+ALL_FORMATS = ["PNG", "JPEG", "TIFF", "BMP", "WEBP", "ICO", "SVG"]
 if HEIC_AVAILABLE:
     ALL_FORMATS.insert(0, "HEIC")
 
@@ -35,6 +50,7 @@ FORMAT_EXT_MAP = {
     "BMP": ".bmp",
     "WEBP": ".webp",
     "ICO": ".ico",
+    "SVG": ".svg",
     "HEIC": ".heic",
 }
 
@@ -47,6 +63,7 @@ EXT_FORMAT_MAP = {
     ".bmp": "BMP",
     ".webp": "WEBP",
     ".ico": "ICO",
+    ".svg": "SVG",
     ".heic": "HEIC",
     ".heif": "HEIC",
 }
@@ -60,8 +77,122 @@ FORMAT_HINTS = {
     "BMP":   "无压缩，文件较大，兼容性最好",
     "WEBP":  "无损模式，体积小，支持透明通道",
     "ICO":   "Windows 图标格式，自动缩放到 256x256，支持透明",
+    "SVG":   "矢量图形（VTrace 矢量化），适合流程图/科研图，无损缩放",
     "HEIC":  "苹果设备常用，压缩率高（需 pillow-heif）",
 }
+
+
+# ---------------------------------------------------------------------------
+# SVG 矢量化（基于 VTrace / Potrace 双方案）
+# ---------------------------------------------------------------------------
+def _raster_to_svg_via_vtrace(src_path: str, dst_path: str) -> None:
+    """使用 VTrace（纯 Python 库）将光栅图矢量化输出为 SVG 文件。
+
+    对流程图、科研图等线条清晰的内容效果最好。
+    无需安装任何外部 .exe 工具。
+    """
+    import vtracer
+
+    img = Image.open(src_path)
+    original_size = img.size
+
+    # 转灰度 → 增强对比度
+    if img.mode != "L":
+        img = img.convert("L")
+    import PIL.ImageOps
+    img = PIL.ImageOps.autocontrast(img, cutoff=5)
+
+    # 保存为临时 PNG
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_png:
+        tmp_png_path = tmp_png.name
+        img.save(tmp_png_path, format="PNG")
+
+    try:
+        # VTrace: 将位图转为 SVG 路径
+        vtracer.convert_image_to_svg_py(
+            tmp_png_path,
+            dst_path,
+            # 针对流程图/科研图优化的参数
+            colormode="binary",         # 二值化，线条分明
+            hierarchical="cutout",      # 层级切分
+            mode="spline",              # 样条曲线，比 polygon 更平滑
+            filter_speckle=8,           # 忽略 8px 以下噪点
+            color_precision=3,          # 颜色合并精度
+            layer_difference=16,        # 层差阈值
+            corner_threshold=60,        # 转角阈值（越高越锐利）
+            length_threshold=4.0,       # 最短线段
+            max_iterations=10,          # 最大迭代
+            splice_threshold=45,        # 接合点角度
+            path_precision=3,           # 路径精度（越小越精细）
+        )
+    finally:
+        try:
+            os.unlink(tmp_png_path)
+        except OSError:
+            pass
+
+
+def _raster_to_svg_via_potrace(src_path: str, dst_path: str,
+                               potrace_binary: str = "potrace") -> None:
+    """将光栅图片通过 Potrace 矢量化输出为 SVG 文件。
+
+    处理流程：
+        源图 → 转灰度 → 增强对比度 → BMP → Potrace → SVG
+    这个流程对流程图、科研图等线条清晰的内容效果最好。
+    """
+    if POTRACE_PATH is None:
+        raise RuntimeError(
+            "未找到 Potrace，请先下载安装：\n"
+            "https://potrace.sourceforge.net/#downloading\n"
+            "将 potrace.exe 放到本工具所在目录，或添加到系统 PATH。"
+        )
+
+    img = Image.open(src_path)
+    original_size = img.size
+
+    # 转灰度 → 自适应阈值二值化（大津法近似）
+    if img.mode != "L":
+        img = img.convert("L")
+
+    # 增强对比度：拉伸直方图
+    import PIL.ImageOps
+    img = PIL.ImageOps.autocontrast(img, cutoff=5)
+
+    # 保存为 BMP（Potrace 要求 BMP 输入）
+    with tempfile.NamedTemporaryFile(suffix=".bmp", delete=False) as tmp_bmp:
+        tmp_bmp_path = tmp_bmp.name
+        img.save(tmp_bmp_path, format="BMP")
+
+    try:
+        # 调用 Potrace：矢量化，输出 SVG
+        # --flat: 扁平的路径（非贝塞尔曲线，节点更少）
+        # --blacklevel: 亮度阈值
+        # --turdsize: 忽略小于此值的噪点
+        # --opttolerance: 优化容差
+        # --alphamax: 转角平滑度
+        # --longcurve: 长曲线阈值
+        cmd = [
+            potrace_binary,
+            "-b", "svg",           # 输出 SVG
+            "--flat",              # 扁平路径，更适合流程图
+            "--turdsize", "8",     # 忽略 8px² 以下噪点
+            "--opttolerance", "0.2",  # 适当优化
+            "--alphamax", "1.0",   # 转角平滑
+            "--longcurve",         # 启用长曲线优化
+            "-o", dst_path,
+            tmp_bmp_path,
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Potrace 失败:\n{result.stderr}")
+    finally:
+        # 清理临时 BMP
+        try:
+            os.unlink(tmp_bmp_path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +200,21 @@ FORMAT_HINTS = {
 # ---------------------------------------------------------------------------
 def convert_image(src_path: str, dst_path: str, target_format: str) -> None:
     """将单张图片转换为指定格式，保存到 dst_path。"""
+    # SVG 矢量化：优先 VTrace（纯 Python），fallback 到 Potrace
+    if target_format == "SVG":
+        if VTRACE_AVAILABLE:
+            _raster_to_svg_via_vtrace(src_path, dst_path)
+        elif POTRACE_AVAILABLE:
+            _raster_to_svg_via_potrace(src_path, dst_path)
+        else:
+            raise RuntimeError(
+                "SVG 转换需要矢量化引擎。请安装 vtrace：\n"
+                "pip install vtrace\n\n"
+                "或下载 Potrace 并放入工具目录：\n"
+                "https://potrace.sourceforge.net/#downloading"
+            )
+        return
+
     img = Image.open(src_path)
     exif_data = img.info.get("exif", b"")
 
