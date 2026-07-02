@@ -88,42 +88,45 @@ FORMAT_HINTS = {
 def _raster_to_svg_via_vtrace(src_path: str, dst_path: str) -> None:
     """使用 VTrace（纯 Python 库）将光栅图矢量化输出为 SVG 文件。
 
-    对流程图、科研图等线条清晰的内容效果最好。
+    Colormode 自动选择：
+      - RGB / RGBA 彩色图 → colormode="color" 保留颜色
+      - 灰度 / 调色板 / 二值图 → colormode="binary" 线稿模式
+
     无需安装任何外部 .exe 工具。
     """
     import vtracer
 
     img = Image.open(src_path)
-    original_size = img.size
+    original_mode = img.mode
 
-    # 转灰度 → 增强对比度
-    if img.mode != "L":
-        img = img.convert("L")
-    import PIL.ImageOps
-    img = PIL.ImageOps.autocontrast(img, cutoff=5)
+    # 判断颜色模式：非灰度/二值图就保留彩色
+    is_color = original_mode in ("RGB", "RGBA", "P", "CMYK", "YCbCr")
 
-    # 保存为临时 PNG
+    # 不需要预先灰度处理 —— 直接保存临时 PNG，由 VTrace 内部处理
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_png:
         tmp_png_path = tmp_png.name
+        # 如果原图是 RGBA 等模式，先转 RGB 避免透明度干扰矢量化颜色分层
+        if is_color and original_mode != "RGB":
+            img = img.convert("RGB")
         img.save(tmp_png_path, format="PNG")
 
+    colormode = "color" if is_color else "binary"
+
     try:
-        # VTrace: 将位图转为 SVG 路径
         vtracer.convert_image_to_svg_py(
             tmp_png_path,
             dst_path,
-            # 针对流程图/科研图优化的参数
-            colormode="binary",         # 二值化，线条分明
-            hierarchical="cutout",      # 层级切分
-            mode="spline",              # 样条曲线，比 polygon 更平滑
-            filter_speckle=8,           # 忽略 8px 以下噪点
-            color_precision=3,          # 颜色合并精度
-            layer_difference=16,        # 层差阈值
-            corner_threshold=60,        # 转角阈值（越高越锐利）
-            length_threshold=4.0,       # 最短线段
-            max_iterations=10,          # 最大迭代
-            splice_threshold=45,        # 接合点角度
-            path_precision=3,           # 路径精度（越小越精细）
+            colormode=colormode,
+            hierarchical="cutout" if is_color else "stacked",
+            mode="spline",
+            filter_speckle=2,           # 只忽略 2px 以下噪点，保留更多细节
+            color_precision=6,          # 颜色量化精度（越大保留越多颜色层）
+            layer_difference=8,         # 层差阈值（越小越能分离相近色）
+            corner_threshold=60,        # 转角阈值
+            length_threshold=2.0,       # 更短线段也保留
+            max_iterations=20,          # 更多迭代，更精细
+            splice_threshold=45,
+            path_precision=1,           # 最高路径精度
         )
     finally:
         try:
