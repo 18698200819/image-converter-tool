@@ -88,51 +88,91 @@ FORMAT_HINTS = {
 def _raster_to_svg_via_vtrace(src_path: str, dst_path: str) -> None:
     """使用 VTrace（纯 Python 库）将光栅图矢量化输出为 SVG 文件。
 
-    Colormode 自动选择：
-      - RGB / RGBA 彩色图 → colormode="color" 保留颜色
-      - 灰度 / 调色板 / 二值图 → colormode="binary" 线稿模式
+    策略：
+      - 2x 上采样 + sharpening + contrast 增强，让文字/细节边缘更清晰
+      - polygon 模式比 spline 更能保留锐利转角
+      - 极高的 color_precision + 极小的 filter_speckle 确保细节不丢失
 
     无需安装任何外部 .exe 工具。
     """
     import vtracer
+    from PIL import ImageFilter, ImageEnhance
 
     img = Image.open(src_path)
     original_mode = img.mode
-
-    # 判断颜色模式：非灰度/二值图就保留彩色
+    original_size = img.size  # (w, h)
     is_color = original_mode in ("RGB", "RGBA", "P", "CMYK", "YCbCr")
 
-    # 不需要预先灰度处理 —— 直接保存临时 PNG，由 VTrace 内部处理
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_png:
-        tmp_png_path = tmp_png.name
-        # 如果原图是 RGBA 等模式，先转 RGB 避免透明度干扰矢量化颜色分层
-        if is_color and original_mode != "RGB":
-            img = img.convert("RGB")
-        img.save(tmp_png_path, format="PNG")
+    # 转 RGB 统一处理
+    if is_color and original_mode != "RGB":
+        img = img.convert("RGB")
+    elif not is_color and original_mode != "RGB":
+        img = img.convert("RGB")  # 灰度也转 RGB 以利边缘增强
+
+    # 2x 上采样 → 提高矢量化分辨率，小字/细线不会被吞掉
+    w, h = img.size
+    up_w, up_h = w * 2, h * 2
+    img = img.resize((up_w, up_h), Image.LANCZOS)
+
+    # 预处理：sharpening + 对比度增强 → 文字边缘更锐利
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=2))
+    img = ImageEnhance.Contrast(img).enhance(1.15)
 
     colormode = "color" if is_color else "binary"
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_png:
+        tmp_png_path = tmp_png.name
+        img.save(tmp_png_path, format="PNG")
 
     try:
         vtracer.convert_image_to_svg_py(
             tmp_png_path,
             dst_path,
             colormode=colormode,
-            hierarchical="cutout" if is_color else "stacked",
-            mode="spline",
-            filter_speckle=2,           # 只忽略 2px 以下噪点，保留更多细节
-            color_precision=6,          # 颜色量化精度（越大保留越多颜色层）
-            layer_difference=8,         # 层差阈值（越小越能分离相近色）
-            corner_threshold=60,        # 转角阈值
-            length_threshold=2.0,       # 更短线段也保留
-            max_iterations=20,          # 更多迭代，更精细
-            splice_threshold=45,
+            hierarchical="stacked",
+            mode="polygon",             # polygon: 保留锐利转角，比 spline 更适合文字
+            filter_speckle=0,           # 不过滤任何细节
+            color_precision=10,         # 高颜色量化精度
+            layer_difference=2,         # 极敏感的色差分层
+            corner_threshold=20,        # 更锐的转角
+            length_threshold=0.3,       # 极短线段也保留
+            max_iterations=30,          # 足够的迭代次数
+            splice_threshold=20,        # 精细接合
             path_precision=1,           # 最高路径精度
         )
+
+        # 修复 SVG viewBox：上采样后尺寸是 2x，设 viewBox 让显示正常
+        _fix_svg_viewbox(dst_path, up_w, up_h, original_size[0], original_size[1])
     finally:
         try:
             os.unlink(tmp_png_path)
         except OSError:
             pass
+
+
+def _fix_svg_viewbox(svg_path: str, render_w: int, render_h: int,
+                     display_w: int, display_h: int) -> None:
+    """将 SVG 的 width/height 改为目标显示尺寸，同时保留 viewBox 覆盖全内容。"""
+    with open(svg_path, "r", encoding="utf-8") as f:
+        svg = f.read()
+
+    # <svg ... width="W" height="H" ...>  → 替换 width/height 为显示尺寸，添加 viewBox
+    import re
+    svg = re.sub(
+        r'width="[^"]*"',
+        f'width="{display_w}"',
+        svg,
+        count=1,
+    )
+    svg = re.sub(
+        r'height="[^"]*"',
+        f'height="{display_h}" viewBox="0 0 {render_w} {render_h}"',
+        svg,
+        count=1,
+    )
+
+    with open(svg_path, "w", encoding="utf-8") as f:
+        f.write(svg)
 
 
 def _raster_to_svg_via_potrace(src_path: str, dst_path: str,
